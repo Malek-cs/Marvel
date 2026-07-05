@@ -1,10 +1,9 @@
-import cv2
 import mediapipe as mp
 import numpy as np
 
 HOLD_FRAMES = 8
 
-# FaceMesh landmark indices
+# Eye landmarks
 LEFT_EYE_TOP     = 159
 LEFT_EYE_BOTTOM  = 145
 RIGHT_EYE_TOP    = 386
@@ -13,15 +12,30 @@ LEFT_EYE_OUTER   = 33
 LEFT_EYE_INNER   = 133
 RIGHT_EYE_OUTER  = 362
 RIGHT_EYE_INNER  = 263
-UPPER_LIP        = 13
-LOWER_LIP        = 14
-TONGUE_TIP       = 17
-NOSE_TIP         = 1
-FOREHEAD         = 10
 
-WINK_THRESHOLD   = 0.15   # EAR below this = eye closed
-TONGUE_THRESHOLD = 0.04
-LOOK_THRESHOLD   = 0.50   # nose offset ratio to trigger look_right
+# Mouth & face
+UPPER_LIP    = 13
+LOWER_LIP    = 14
+TONGUE_TIP   = 17
+MOUTH_LEFT   = 78     # left lip commissure
+MOUTH_RIGHT  = 308    # right lip commissure
+CHEEK_LEFT   = 234    # left cheekbone outer
+CHEEK_RIGHT  = 454    # right cheekbone outer
+
+# Nose & head
+NOSE_TIP  = 1
+FOREHEAD  = 10
+
+# Brows (for emotion)
+BROW_LEFT  = 70
+BROW_RIGHT = 300
+
+# Thresholds
+WINK_THRESHOLD    = 0.15
+TONGUE_THRESHOLD  = 0.04
+SMILE_THRESHOLD   = 0.38   # mouth_width / face_width → smile
+OPEN_MOUTH_TH     = 0.06   # lip_gap / h → open mouth
+
 
 class FaceDetector:
     def __init__(self):
@@ -32,18 +46,18 @@ class FaceDetector:
             min_detection_confidence=0.6,
             min_tracking_confidence=0.6,
         )
-        self._counter = {}
+        self._counter        = {}
         self.mouth_center    = None
         self.nose_center     = None
         self.forehead_center = None
+        self._ratios         = None   # for EmotionDetector
 
     def detect(self, rgb_frame, draw_frame):
         result = self.face_mesh.process(rgb_frame)
         if not result.multi_face_landmarks:
             self._counter.clear()
-            self.mouth_center    = None
-            self.nose_center     = None
-            self.forehead_center = None
+            self.mouth_center = self.nose_center = self.forehead_center = None
+            self._ratios = None
             return None
 
         lm = result.multi_face_landmarks[0].landmark
@@ -64,36 +78,41 @@ class FaceDetector:
         lip_gap  = np.linalg.norm(pt(UPPER_LIP) - pt(LOWER_LIP)) / h
         tongue_y = lm[TONGUE_TIP].y
 
-        look_dir = self._head_yaw(lm)
+        mouth_w  = abs(lm[MOUTH_RIGHT].x - lm[MOUTH_LEFT].x)
+        face_w   = abs(lm[CHEEK_RIGHT].x  - lm[CHEEK_LEFT].x)  + 1e-6
+        smile_ratio = mouth_w / face_w
 
-        # live debug: show yaw value on frame so you can tune LOOK_THRESHOLD
-        cv2.putText(draw_frame, f"yaw:{look_dir:+.2f} thr:{LOOK_THRESHOLD}",
-                    (10, draw_frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+        brow_avg = (lm[BROW_LEFT].y + lm[BROW_RIGHT].y) / 2
 
-        return self._classify(left_ear, right_ear, lip_gap, tongue_y, lm, look_dir)
+        self._ratios = {
+            "smile_ratio": smile_ratio,
+            "lip_gap":     lip_gap,
+            "brow_avg_y":  brow_avg,
+            "left_ear":    left_ear,
+            "right_ear":   right_ear,
+        }
+
+        return self._classify(left_ear, right_ear, lip_gap, tongue_y,
+                               lm, smile_ratio)
+
+    def get_ratios(self) -> dict | None:
+        return self._ratios
 
     def _ear(self, top, bottom, outer, inner):
-        vertical   = np.linalg.norm(top - bottom)
-        horizontal = np.linalg.norm(outer - inner)
-        return vertical / (horizontal + 1e-6)
+        return np.linalg.norm(top - bottom) / (np.linalg.norm(outer - inner) + 1e-6)
 
-    def _head_yaw(self, lm):
-        # nose x relative to midpoint between both eye outer corners (normalised 0-1)
-        nose_x   = lm[NOSE_TIP].x
-        center_x = (lm[LEFT_EYE_OUTER].x + lm[RIGHT_EYE_OUTER].x) / 2
-        eye_width = abs(lm[RIGHT_EYE_OUTER].x - lm[LEFT_EYE_OUTER].x)
-        offset    = (nose_x - center_x) / (eye_width + 1e-6)
-        # on a mirrored frame: positive offset = user looking to their RIGHT
-        return offset
-
-    def _classify(self, left_ear, right_ear, lip_gap, tongue_y, lm, look_dir):
+    def _classify(self, left_ear, right_ear, lip_gap, tongue_y, lm, smile_ratio):
         if left_ear < WINK_THRESHOLD and right_ear > WINK_THRESHOLD:
             return self._confirm("wink_left")
         if right_ear < WINK_THRESHOLD and left_ear > WINK_THRESHOLD:
             return self._confirm("wink_right")
         if lip_gap > TONGUE_THRESHOLD and tongue_y > lm[LOWER_LIP].y:
             return self._confirm("tongue_out")
+        if lip_gap > OPEN_MOUTH_TH:
+            return self._confirm("open_mouth")
+        if smile_ratio > SMILE_THRESHOLD:
+            return self._confirm("smile")
+
         self._counter.clear()
         return None
 

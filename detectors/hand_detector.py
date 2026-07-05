@@ -1,9 +1,9 @@
 import mediapipe as mp
 import numpy as np
 
-HOLD_FRAMES  = 8
-NOSE_RADIUS   = 75   # pixels — hand tip within this distance of nose tip
-HAIR_SLACK_PX = 50  # how many px below the forehead still counts as "on hair"
+HOLD_FRAMES   = 8
+NOSE_RADIUS   = 75
+HAIR_SLACK_PX = 50
 
 WRIST      = 0
 THUMB_TIP  = 4
@@ -20,6 +20,7 @@ PINKY_MCP  = 17
 
 _TIPS = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
 
+
 class HandDetector:
     def __init__(self):
         self.mp_hands = mp.solutions.hands
@@ -28,19 +29,23 @@ class HandDetector:
             min_detection_confidence=0.7,
             min_tracking_confidence=0.6,
         )
-        self._counter = {}
+        self._counter      = {}
+        self.last_landmarks = None   # exposed for trainer
 
-    def detect(self, rgb_frame, draw_frame, mouth_center=None, nose_center=None, forehead_center=None):
+    def detect(self, rgb_frame, draw_frame, nose_center=None, forehead_center=None):
         result = self.hands.process(rgb_frame)
+
         if not result.multi_hand_landmarks:
             self._counter.clear()
+            self.last_landmarks = None
             return None
 
-        # two hands visible → triggers the second video
         if len(result.multi_hand_landmarks) == 2:
+            self.last_landmarks = result.multi_hand_landmarks[0]
             return self._confirm("two_hands")
 
         lm = result.multi_hand_landmarks[0].landmark
+        self.last_landmarks = result.multi_hand_landmarks[0]
         h, w = draw_frame.shape[:2]
 
         def pt(idx):
@@ -48,21 +53,22 @@ class HandDetector:
 
         tips_px = [pt(t) for t in _TIPS]
 
-        # hand on hair: any fingertip above (or just at) the forehead line
+        # Hand on hair: any fingertip above the forehead line
         if forehead_center is not None:
             hair_line_y = forehead_center[1] + HAIR_SLACK_PX
             if any(tp[1] < hair_line_y for tp in tips_px):
                 return self._confirm("hand_on_head")
 
+        # Hand on nose
         if nose_center is not None:
             if any(np.linalg.norm(tp - nose_center) < NOSE_RADIUS for tp in tips_px):
                 return self._confirm("hand_on_nose")
 
-        fingers = self._fingers_up(lm)
-
+        # Thumbs up (dedicated check — more accurate)
         if self._is_thumbs_up(lm):
             return self._confirm("thumbs_up")
 
+        fingers = self._fingers_up(lm)
         return self._classify(fingers)
 
     def _fingers_up(self, lm):
@@ -70,19 +76,14 @@ class HandDetector:
         bases = [INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP]
         return [lm[t].y < lm[b].y for t, b in zip(tips, bases)]
 
-    def _is_thumbs_up(self, lm):
-        # thumb tip must be clearly above its own base
-        thumb_pointing_up = lm[THUMB_TIP].y < lm[THUMB_MCP].y - 0.04
-
-        # all four fingers must be curled down
-        finger_tips  = [INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
-        finger_bases = [INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP]
-        fingers_down = all(lm[t].y > lm[b].y for t, b in zip(finger_tips, finger_bases))
-
-        # thumb tip must be above the wrist (not a sideways thumb)
-        thumb_above_wrist = lm[THUMB_TIP].y < lm[WRIST].y
-
-        return thumb_pointing_up and fingers_down and thumb_above_wrist
+    def _is_thumbs_up(self, lm) -> bool:
+        thumb_up      = lm[THUMB_TIP].y < lm[THUMB_MCP].y - 0.04
+        fingers_down  = all(lm[t].y > lm[b].y
+                            for t, b in zip(
+                                [INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP],
+                                [INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP]))
+        above_wrist   = lm[THUMB_TIP].y < lm[WRIST].y
+        return thumb_up and fingers_down and above_wrist
 
     def _classify(self, fingers):
         index, middle, ring, pinky = fingers
