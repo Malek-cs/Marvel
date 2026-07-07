@@ -1,5 +1,4 @@
 import threading
-import numpy as np
 
 class AppState:
     def __init__(self):
@@ -11,7 +10,10 @@ class AppState:
 
         self.current_gesture   = ""
         self.current_combo     = ""
+        self.current_emotion   = ""
         self.combined_frame    = None   # latest rendered frame (for dashboard)
+        self.stop_requested    = False  # set True to shut down the loop
+        self.cam_error         = False
 
         self._map_lock         = threading.Lock()
         self.gesture_map       = {}     # seeded by matcher on init
